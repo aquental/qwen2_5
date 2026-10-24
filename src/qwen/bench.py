@@ -23,7 +23,7 @@ from datetime import datetime
 
 import ollama
 
-MODEL = "qwen2.5-coder:7b"
+MODEL = "qwen3.8:27b"
 NUM_CTX = 4096
 STALL_TIMEOUT = 180.0  # s sem nenhum chunk => aborta
 SAMPLE_INTERVAL = 0.2  # 5 Hz

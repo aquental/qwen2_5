@@ -1,13 +1,13 @@
 # qwen2_5
 
-Benchmark de latência do `qwen2.5-coder:7b` via Ollama local, com
+Benchmark de latência do `qwen3.8:27b` via Ollama local, com
 amostragem de métricas de uma GPU NVIDIA.
 
 ## Requisitos
 
 - Python 3.14 ou superior e [uv](https://docs.astral.sh/uv/).
 - Para o benchmark: Ollama em `http://127.0.0.1:11434`, modelo
-  `qwen2.5-coder:7b` baixado e `nvidia-smi` no PATH.
+  `qwen3.8:27b` baixado e `nvidia-smi` no PATH.
 - A consulta atual espera uma única GPU NVIDIA.
 - Os testes não precisam de GPU, servidor Ollama ou acesso à rede.
 
@@ -28,7 +28,7 @@ use `uv sync --locked --no-dev`.
 Inicie o Ollama (`ollama serve`, se não estiver rodando como serviço), depois:
 
 ```bash
-ollama pull qwen2.5-coder:7b
+ollama pull qwen3.8:27b
 nvidia-smi
 uv run qwen-bench
 ```
@@ -41,6 +41,15 @@ repetições. Modelo, prompt, contexto (`4096`), timeout (`180 s`) e intervalo d
 amostragem são constantes em `src/qwen/bench.py`.
 
 ### Métricas e limitações
+O modelo padrão tem aproximadamente 18 GB de download e exige memória adicional
+para inferência. Em uma GPU de 11 GB, a execução exige offload para CPU/RAM e
+pode ser significativamente mais lenta. O contexto permanece em 4096 tokens.
+
+O Qwen3.8 pode emitir chunks de raciocínio (`thinking`). Este benchmark mantém
+o comportamento padrão do modelo: o TTFT mede apenas o primeiro chunk de
+resposta textual, ignorando os chunks de raciocínio. As métricas de geração
+são as fornecidas pelo servidor e não se limitam ao texto contado pelo cliente.
+Não compare diretamente esse TTFT com modelos sem raciocínio.
 
 - **TTFT**: tempo do cliente até o primeiro chunk com texto, incluindo preparação
   da requisição e espera pela resposta.

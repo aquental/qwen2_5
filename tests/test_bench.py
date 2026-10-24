@@ -9,6 +9,11 @@ import pytest
 from qwen import bench
 
 
+def test_default_model_configuration():
+    assert bench.MODEL == "qwen3.8:27b"
+    assert bench.NUM_CTX == 4096
+
+
 def response(**overrides):
     return ollama.GenerateResponse(
         **(
