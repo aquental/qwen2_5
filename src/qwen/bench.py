@@ -47,6 +47,7 @@ GPU_FIELDS = (
 def sample_gpu():
     out = subprocess.run(
         ["nvidia-smi", f"--query-gpu={GPU_FIELDS}", "--format=csv,noheader,nounits"],
+        check=True,
         capture_output=True,
         text=True,
         timeout=5,
@@ -60,7 +61,7 @@ class GpuSampler(threading.Thread):
     def __init__(self, interval=SAMPLE_INTERVAL):
         super().__init__(daemon=True)
         self.interval = interval
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.samples = []  # (t_rel, mem_used, mem_free, util, watts, temp, sm_mhz)
         self.peak_mem = 0
         self.peak_util = 0
@@ -70,23 +71,31 @@ class GpuSampler(threading.Thread):
 
     def run(self):
         self._t0 = time.perf_counter()
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 mem_used, mem_free, util, watts, temp, sm = sample_gpu()
                 t = time.perf_counter() - self._t0
-                rec = (t, int(mem_used), int(mem_free), int(util), float(watts), int(temp), int(sm))
+                rec = (
+                    t,
+                    int(mem_used),
+                    int(mem_free),
+                    int(util),
+                    float(watts),
+                    int(temp),
+                    int(sm),
+                )
                 self.samples.append(rec)
                 self.peak_mem = max(self.peak_mem, rec[1])
                 self.peak_util = max(self.peak_util, rec[3])
                 self.peak_watts = max(self.peak_watts, rec[4])
                 self.peak_temp = max(self.peak_temp, rec[5])
-            except Exception:
+            except OSError, ValueError, subprocess.SubprocessError:
                 pass
-            time.sleep(self.interval)
+            self._stop_event.wait(self.interval)
 
     def stop(self):
-        self._stop.set()
-        self.join(timeout=3)
+        self._stop_event.set()
+        self.join(timeout=6)
 
     def peak_window(self):
         """Janela de tempo em que a VRAM esteve no pico (util >= 50% ou mem no pico)."""
@@ -110,23 +119,23 @@ def baseline():
 
 def run_stream(prompt, label):
     """Uma passada de streaming. Retorna dict de métricas ou marcador de estol."""
-    client = ollama.Client(host="http://127.0.0.1:11434")
-    stream = client.generate(
-        model=MODEL,
-        prompt=prompt,
-        stream=True,
-        options={"num_ctx": NUM_CTX, "temperature": 0.2, "seed": 42},
-    )
+    client = ollama.Client(host="http://127.0.0.1:11434", timeout=STALL_TIMEOUT)
 
     t0 = time.perf_counter()
     ttft = None
     chunk_count = 0
     chars = 0
-    last_activity = t0
     final = None
     stalled = False
+    stream = None
 
     try:
+        stream = client.generate(
+            model=MODEL,
+            prompt=prompt,
+            stream=True,
+            options={"num_ctx": NUM_CTX, "temperature": 0.2, "seed": 42},
+        )
         for chunk in stream:
             now = time.perf_counter()
             if chunk.response:
@@ -134,16 +143,15 @@ def run_stream(prompt, label):
                     ttft = now - t0
                 chunk_count += 1
                 chars += len(chunk.response)
-            last_activity = now
-            if now - last_activity > STALL_TIMEOUT:
-                stalled = True
-                break
             if chunk.done:
                 final = chunk
                 break
     except Exception as exc:  # noqa: BLE001 - diagnóstico do benchmark
         print(f"  [{label}] EXCEÇÃO durante o streaming: {type(exc).__name__}: {exc}")
         stalled = True
+    finally:
+        if stream is not None:
+            stream.close()
 
     if final is None and not stalled:
         stalled = True
@@ -177,23 +185,31 @@ def run_stream(prompt, label):
 def report(r, label, gpu=None):
     print(f"\n### {label}")
     if r["stalled"]:
-        print("  RESULTADO: ESTOL - nenhum chunk novo dentro do watchdog")
-        if r.get("ttft"):
+        print("  RESULTADO: ESTOL/ERRO - timeout, falha ou stream incompleto")
+        if r.get("ttft") is not None:
             print(f"  ttft antes do estol   = {r['ttft']:.3f} s")
         print(f"  chunks recebidos      = {r['chunks']}")
         return
-    print(f"  ttft_cliente_s        = {r['ttft']:.3f}   (primeiro chunk; inclui rede + prefix search)")
+
+    def fmt(value):
+        return f"{value:.3f}" if value is not None else "N/A"
+
+    print(
+        f"  ttft_cliente_s        = {fmt(r['ttft'])}   (primeiro chunk; inclui rede + prefix search)"
+    )
     print(f"  prompt_eval_count     = {r['prompt_eval_count']} tokens")
-    print(f"  prompt_eval_s         = {r['prompt_eval_s']:.3f}")
+    print(f"  prompt_eval_s         = {fmt(r['prompt_eval_s'])}")
     if r["prompt_tok_s"]:
-        print(f"  prompt_tok_s          = {r['prompt_tok_s']:.1f}   (prefill puro, sem overhead de cliente)")
+        print(
+            f"  prompt_tok_s          = {r['prompt_tok_s']:.1f}   (prefill puro, sem overhead de cliente)"
+        )
     print(f"  eval_count            = {r['eval_count']} tokens gerados")
-    print(f"  eval_s                = {r['eval_s']:.3f}")
+    print(f"  eval_s                = {fmt(r['eval_s'])}")
     if r["gen_tok_s"]:
         print(f"  gen_tok_s             = {r['gen_tok_s']:.1f}")
     if r["per_token_ms"]:
         print(f"  per_token_ms          = {r['per_token_ms']:.1f}")
-    print(f"  total_s               = {r['total_s']:.3f}")
+    print(f"  total_s               = {fmt(r['total_s'])}")
     if r["load_s"]:
         print(f"  load_s                = {r['load_s']:.3f}")
     print(f"  stream_chunks         = {r['chunks']}  (NAO e contagem de tokens)")
@@ -204,7 +220,9 @@ def report(r, label, gpu=None):
         print(f"  pico_temp_c           = {gpu.peak_temp}")
         w = gpu.peak_window()
         if w:
-            print(f"  janela_quente_s       = {w[0]:.2f} -> {w[1]:.2f}  (dur {w[1] - w[0]:.2f}s)")
+            print(
+                f"  janela_quente_s       = {w[0]:.2f} -> {w[1]:.2f}  (dur {w[1] - w[0]:.2f}s)"
+            )
 
 
 def main():
@@ -218,11 +236,13 @@ def main():
     print(f"modelo_ja_carregado   = {bool(loaded)}")
     if loaded:
         m = loaded[0]
-        print(f"  processor           = {m.processor}  ctx={m.context_length}")
+        print(f"  size_vram_bytes     = {m.size_vram}  ctx={m.context_length}")
 
     b = baseline()
-    print(f"baseline_pre_warmup   = vram {b['mem_used']} MiB usados / {b['mem_free']} livres | "
-          f"gpu {b['util']}% | {b['watts']:.1f} W | {b['temp']} C | sm {b['sm_mhz']} MHz")
+    print(
+        f"baseline_pre_warmup   = vram {b['mem_used']} MiB usados / {b['mem_free']} livres | "
+        f"gpu {b['util']}% | {b['watts']:.1f} W | {b['temp']} C | sm {b['sm_mhz']} MHz"
+    )
 
     # ---- FASE 1: WARMUP (nao medido) ------------------------------------
     # Garante modelo residente e prefix cache populado, para que a medicao
@@ -232,23 +252,30 @@ def main():
     if warm["stalled"]:
         print("  WARMUP ESTOLOU - o servidor nao respondeu. Diagnostico:")
         print("    journalctl -u ollama -n 50 --no-pager")
-        print("    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv")
+        print(
+            "    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv"
+        )
         return 1
-    print(f"  warmup ok: ttft={warm['ttft']:.3f}s  gen_tok_s={warm['gen_tok_s']:.1f}  "
-          f"prompt_tok_s={warm['prompt_tok_s']:.1f}")
+    report(warm, "WARMUP (nao medido)")
     time.sleep(1.0)
 
     # ---- FASE 2: MEDICAO com amostragem ---------------------------------
     print("\n>>> medicao com amostragem de GPU a 5 Hz")
     gpu = GpuSampler()
     gpu.start()
-    res = run_stream(PROMPT, "medicao")
-    gpu.stop()
+    try:
+        res = run_stream(PROMPT, "medicao")
+    finally:
+        gpu.stop()
     report(res, "MEDICAO (prompt cache quente)", gpu)
+    if res["stalled"]:
+        return 1
 
     mem_used, mem_free, util, watts, temp, sm = sample_gpu()
-    print(f"\npos_medicao           = vram {mem_used} MiB usados / {mem_free} livres | "
-          f"gpu {util}% | {watts:.1f} W | {temp} C | sm {sm} MHz")
+    print(
+        f"\npos_medicao           = vram {mem_used} MiB usados / {mem_free} livres | "
+        f"gpu {util}% | {float(watts):.1f} W | {temp} C | sm {sm} MHz"
+    )
 
     # ---- FASE 3: REPETICOES ---------------------------------------------
     reps = []
